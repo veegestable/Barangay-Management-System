@@ -2,22 +2,34 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const QRCode = require('qrcode');
+const { Parser } = require('json2csv');
+const bcrypt = require('bcryptjs');
 require('dotenv').config();
+const { v4: uuidv4 } = require('uuid');
+const os = require('os'); // Import the os module
+const qrcode = require('qrcode-terminal'); // Import the QR code terminal package
+
 
 const app = express();
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
-app.use(bodyParser.json());
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type'],
+}));
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
 
 // Connect to MongoDB
-console.log('MongoDB URI:', process.env.MONGO_URI);
-mongoose.connect(process.env.MONGO_URI)
+mongoose
+  .connect(process.env.MONGO_URI)
   .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .catch((err) => console.error('MongoDB connection error:', err));
 
-// Define Mongoose Schemas and Models
+// Schemas & Models
 const ResidentSchema = new mongoose.Schema({
   id: String,
   firstName: String,
@@ -33,13 +45,17 @@ const ResidentSchema = new mongoose.Schema({
   voterStatus: String,
   specialCategory: String,
 });
+const Resident = mongoose.model('Resident', ResidentSchema);
 
-const EmergencyContactSchema = new mongoose.Schema({
-  id: String,
-  name: String,
-  phone: String,
-  email: String,
+const ResidentActivitySchema = new mongoose.Schema({
+  action: { type: String, enum: ['added', 'updated', 'deleted'], required: true },
+  residentName: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now },
 });
+const ResidentActivity = mongoose.model('ResidentActivity', ResidentActivitySchema);
+
+const EmergencyContactSchema = new mongoose.Schema({ id: String, name: String, phone: String, email: String });
+const EmergencyContact = mongoose.model('EmergencyContact', EmergencyContactSchema);
 
 const ComplaintSchema = new mongoose.Schema({
   id: String,
@@ -50,190 +66,446 @@ const ComplaintSchema = new mongoose.Schema({
   status: String,
   date: String,
 });
-
-const Resident = mongoose.model('Resident', ResidentSchema);
-const EmergencyContact = mongoose.model('EmergencyContact', EmergencyContactSchema);
 const Complaint = mongoose.model('Complaint', ComplaintSchema);
 
-// CRUD Operations
+const AnnouncementSchema = new mongoose.Schema({
+  title: String,
+  caption: String,
+  image: String,
+  date: { type: Date, default: Date.now },
+});
+const Announcement = mongoose.model('Announcement', AnnouncementSchema);
 
-// Route to save resident data
-app.post('/residents', async (req, res) => {
-  const residentData = req.body;
+const UserSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  role: { type: String, enum: ['admin', 'user'], required: true },
+  status: { type: String, enum: ['approved', 'pending'], default: 'approved' },
+  qrCode: String,
+});
+const User = mongoose.model('User', UserSchema);
 
-  // Validate input fields
-  if (!residentData.id || !residentData.firstName || !residentData.middleName || !residentData.lastName || !residentData.dob || !residentData.age || !residentData.sex || !residentData.address || !residentData.contact || !residentData.civilStatus || !residentData.occupation || !residentData.voterStatus || !residentData.specialCategory) {
-    return res.status(400).json({ message: 'All fields are required' });
-  }
-
+// Helper for logging activities
+async function logResidentActivity(action, residentName) {
   try {
-    const resident = new Resident(residentData);
-    await resident.save();
+    const activity = new ResidentActivity({ action, residentName });
+    await activity.save();
+  } catch (err) {
+    console.error('Error logging activity:', err);
+  }
+}
+
+// ===== Auth & User Routes =====
+app.post('/users', async (req, res) => {
+  const { username, password, role } = req.body;
+  if (!username || !password || !role)
+    return res.status(400).json({ message: 'Username, password, and role required' });
+  try {
+    if (await User.findOne({ username }))
+      return res.status(400).json({ message: 'Username exists' });
+    const hashed = await bcrypt.hash(password, 10);
+    const qrData = JSON.stringify({ username });
+    const qrCode = await QRCode.toDataURL(qrData);
+    const user = new User({
+      username,
+      password: hashed,
+      role,
+      status: role === 'admin' ? 'pending' : 'approved',
+      qrCode,
+    });
+    await user.save();
+    const msg =
+      role === 'admin'
+        ? 'Admin account request submitted. Awaiting approval.'
+        : 'User account created successfully.';
+    res.status(201).json({ message: msg, qrCode });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to create user' });
+  }
+});
+
+app.post('/users/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Check if the admin account is rejected
+    if (user.role === 'admin' && user.status === 'rejected') {
+      return res.status(403).json({ message: 'Admin account has been rejected' });
+    }
+
+    // Check if the admin account is pending
+    if (user.role === 'admin' && user.status !== 'approved') {
+      return res.status(403).json({ message: 'Admin account not approved yet' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+
+    res.json({ message: 'Login successful', username: user.username, role: user.role });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Login failed' });
+  }
+});
+
+app.post('/users/login-with-qr', async (req, res) => {
+  const { qrData } = req.body; // e.g., { username: "sampleUser" }
+  try {
+    const user = await User.findOne({ username: qrData.username });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Check if the admin account is rejected
+    if (user.role === 'admin' && user.status === 'rejected') {
+      return res.status(403).json({ message: 'Admin account has been rejected' });
+    }
+
+    // Check if the admin account is pending
+    if (user.role === 'admin' && user.status !== 'approved') {
+      return res.status(403).json({ message: 'Admin account not approved yet' });
+    }
+
+    res.json({ message: 'QR login successful', username: user.username, role: user.role });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'QR login failed' });
+  }
+});
+
+
+// Admin approval
+app.get('/admin/requests', async (req, res) => {
+  try {
+    const pendingAdmins = await User.find({ role: 'admin', status: 'pending' });
+    res.json(pendingAdmins);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch pending admins' });
+  }
+});
+
+app.put('/admin/requests/:username/approve', async (req, res) => {
+  const { status } = req.body; // Expect 'approved' or 'rejected'
+  try {
+    const user = await User.findOneAndUpdate(
+      { username: req.params.username },
+      { status }, // Update the status to 'approved' or 'rejected'
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const message =
+      status === 'approved'
+        ? 'Admin approved successfully'
+        : 'Admin rejected successfully';
+    res.json({ message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to update admin status' });
+  }
+});
+
+// ===== Resident CRUD & Activity Logging =====
+app.post('/residents', async (req, res) => {
+  try {
+    const data = req.body;
+    data.id = uuidv4(); // Generate a unique ID for the resident
+    await new Resident(data).save();
+    await logResidentActivity('added', `${data.firstName} ${data.lastName}`);
     res.status(201).json({ message: 'Resident saved successfully' });
-  } catch (error) {
-    console.error('Error saving resident:', error);
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to save resident' });
   }
 });
 
-// Route to save emergency contact
-app.post('/emergency-contacts', async (req, res) => {
-  const contactData = req.body;
 
-  // Validate input fields
-  if (!contactData.id || !contactData.name || !contactData.phone) {
-    return res.status(400).json({ message: 'ID, Name, and Phone are required' });
-  }
-
+app.post('/residents/bulk', async (req, res) => {
+  const residents = req.body;
   try {
-    const contact = new EmergencyContact(contactData);
-    await contact.save();
-    res.status(201).json({ message: 'Emergency contact saved successfully' });
-  } catch (error) {
-    console.error('Error saving emergency contact:', error);
-    res.status(500).json({ message: 'Failed to save emergency contact' });
-  }
-});
+    const savedResidents = [];
 
-// Route to save complaint
-app.post('/complaints', async (req, res) => {
-  const complaintData = req.body;
-
-  // Validate input fields
-  if (!complaintData.id || !complaintData.name || !complaintData.type || !complaintData.message || !complaintData.status || !complaintData.date) {
-    return res.status(400).json({ message: 'ID, Name, Type, Message, Status, and Date are required' });
-  }
-
-  try {
-    const complaint = new Complaint(complaintData);
-    await complaint.save();
-    res.status(201).json({ message: 'Complaint saved successfully' });
-  } catch (error) {
-    console.error('Error saving complaint:', error);
-    res.status(500).json({ message: 'Failed to save complaint' });
-  }
-});
-
-// Read (R)
-app.get('/residents/:id', async (req, res) => {
-  const id = req.params.id;
-
-  try {
-    const resident = await Resident.findOne({ id });
-    if (!resident) {
-      return res.status(404).json({ message: 'Resident not found' });
+    for (const resident of residents) {
+      const id = uuidv4(); // Generate a unique ID for each resident
+      const newResident = new Resident({ ...resident, id });
+      await newResident.save();
+      await logResidentActivity('added', `${resident.firstName} ${resident.lastName}`);
+      savedResidents.push(newResident);
     }
-    res.json(resident);
+
+    res.status(201).json({ message: 'Residents imported successfully', data: savedResidents });
   } catch (error) {
-    console.error('Error fetching resident:', error);
-    res.status(500).json({ message: 'Failed to fetch resident' });
+    console.error("Error importing residents:", error);
+    res.status(500).json({ message: 'Failed to import residents' });
   }
 });
 
-// Read all residents
+
 app.get('/residents', async (req, res) => {
-  try {
-    const residents = await Resident.find();
-    res.json(residents);
-  } catch (error) {
-    console.error('Error fetching residents:', error);
+  try {    
+    const list = await Resident.find();
+    res.json(list);
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to fetch residents' });
   }
 });
 
-// Read all emergency contacts
-app.get('/emergency-contacts', async (req, res) => {
+// Fetch 5 most recent activities
+app.get('/residents/recent-activities', async (req, res) => {
   try {
-    const contacts = await EmergencyContact.find();
-    res.json(contacts);
-  } catch (error) {
-    console.error('Error fetching emergency contacts:', error);
-    res.status(500).json({ message: 'Failed to fetch emergency contacts' });
+    const activities = await ResidentActivity.find()
+      .sort({ timestamp: -1 })
+      .limit(5);
+    res.status(200).json(activities);
+  } catch (err) {
+    console.error('Error fetching recent activities:', err);
+    res.status(500).json({ message: 'Failed to fetch recent activities' });
   }
 });
 
-// Read all complaints
-app.get('/complaints', async (req, res) => {
+// ===== CSV Export =====
+app.get('/residents/export', async (req, res) => {
   try {
-    const complaints = await Complaint.find();
-    res.json(complaints);
-  } catch (error) {
-    console.error('Error fetching complaints:', error);
-    res.status(500).json({ message: 'Failed to fetch complaints' });
+    const list = await Resident.find();
+    if (!list.length) return res.status(404).json({ message: 'No residents found' });
+
+    const fields = [
+      'id', 'firstName', 'middleName', 'lastName', 'dob', 'age',
+      'sex', 'address', 'contact', 'civilStatus', 'occupation',
+      'voterStatus', 'specialCategory'
+    ];
+    const csv = new Parser({ fields }).parse(list);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('residents.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to export residents' });
   }
 });
 
-// Update (U)
+
+app.get('/residents/:id', async (req, res) => {
+  try {
+    const r = await Resident.findOne({ id: req.params.id });
+    if (!r) return res.status(404).json({ message: 'Resident not found' });
+    res.json(r);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch resident' });
+  }
+});
 app.put('/residents/:id', async (req, res) => {
-  const id = req.params.id;
-  const updateData = req.body;
-
   try {
-    const resident = await Resident.findOneAndUpdate({ id }, updateData, { new: true });
-    if (!resident) {
-      return res.status(404).json({ message: 'Resident not found' });
-    }
-    res.status(200).json({ message: 'Resident updated successfully', resident });
-  } catch (error) {
-    console.error('Error updating resident:', error);
+    const upd = req.body;
+    const r = await Resident.findOneAndUpdate({ id: req.params.id }, upd, { new: true });
+    if (!r) return res.status(404).json({ message: 'Resident not found' });
+    await logResidentActivity('updated', `${upd.firstName} ${upd.lastName}`);
+    res.json({ message: 'Resident updated successfully' });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to update resident' });
   }
 });
-
-// Update complaint status
-app.put('/complaints/:id', async (req, res) => {
-  const id = req.params.id;
-  const { status } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ message: 'Status is required to update' });
-  }
-
-  try {
-    const complaint = await Complaint.findOneAndUpdate({ id }, { status }, { new: true });
-    if (!complaint) {
-      return res.status(404).json({ message: 'Complaint not found' });
-    }
-    res.status(200).json({ message: 'Complaint status updated successfully', complaint });
-  } catch (error) {
-    console.error('Error updating complaint status:', error);
-    res.status(500).json({ message: 'Failed to update complaint status' });
-  }
-});
-
-// Delete (D)
 app.delete('/residents/:id', async (req, res) => {
-  const id = req.params.id;
-
   try {
-    const resident = await Resident.findOneAndDelete({ id });
-    if (!resident) {
-      return res.status(404).json({ message: 'Resident not found' });
-    }
-    res.status(200).json({ message: 'Resident deleted successfully' });
-  } catch (error) {
-    console.error('Error deleting resident:', error);
+    const r = await Resident.findOneAndDelete({ id: req.params.id });
+    if (!r) return res.status(404).json({ message: 'Resident not found' });
+    await logResidentActivity('deleted', `${r.firstName} ${r.lastName}`);
+    res.json({ message: 'Resident deleted successfully' });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to delete resident' });
   }
 });
 
-// Delete complaint
-app.delete('/complaints/:id', async (req, res) => {
-  const id = req.params.id;
 
+
+
+
+
+// ===== Emergency Contacts =====
+app.post('/emergency-contacts', async (req, res) => {
   try {
-    const complaint = await Complaint.findOneAndDelete({ id });
-    if (!complaint) {
-      return res.status(404).json({ message: 'Complaint not found' });
-    }
-    res.status(200).json({ message: 'Complaint deleted successfully' });
-  } catch (error) {
-    console.error('Error deleting complaint:', error);
+    await new EmergencyContact(req.body).save();
+    res.status(201).json({ message: 'Emergency contact saved successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to save emergency contact' });
+  }
+});
+app.get('/emergency-contacts', async (req, res) => {
+  try {
+    res.json(await EmergencyContact.find());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch emergency contacts' });
+  }
+});
+app.get('/emergency-contacts/export', async (req, res) => {
+  try {
+    const contacts = await EmergencyContact.find();
+    if (!contacts.length) return res.status(404).json({ message: 'No emergency contacts found' });
+
+    const fields = ['id', 'name', 'phone', 'email'];
+    const csv = new Parser({ fields }).parse(contacts);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('emergency_contacts.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to export emergency contacts' });
+  }
+});
+
+// ===== Complaints =====
+app.post('/complaints', async (req, res) => {
+  try {
+    await new Complaint(req.body).save();
+    res.status(201).json({ message: 'Complaint saved successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to save complaint' });
+  }
+});
+app.get('/complaints', async (req, res) => {
+  try {
+    res.json(await Complaint.find());
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch complaints' });
+  }
+});
+app.put('/complaints/:id', async (req, res) => {
+  try {
+    const c = await Complaint.findOneAndUpdate({ id: req.params.id }, { status: req.body.status }, { new: true });
+    if (!c) return res.status(404).json({ message: 'Complaint not found' });
+    res.json({ message: 'Complaint status updated successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to update complaint status' });
+  }
+});
+app.delete('/complaints/:id', async (req, res) => {
+  try {
+    const c = await Complaint.findOneAndDelete({ id: req.params.id });
+    if (!c) return res.status(404).json({ message: 'Complaint not found' });
+    res.json({ message: 'Complaint deleted successfully' });
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Failed to delete complaint' });
   }
 });
 
+// ===== Announcements =====
+app.post('/announcements', async (req, res) => {
+  try {
+    const a = new Announcement(req.body);
+    await a.save();
+    res.status(201).json({ message: 'Announcement posted successfully', announcement: a });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to post announcement' });
+  }
+});
+app.get('/announcements', async (req, res) => {
+  try {
+    res.json(await Announcement.find().sort({ date: -1 }));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch announcements' });
+  }
+});
+app.get('/announcements/recent', async (req, res) => {
+  try {
+    res.json(await Announcement.find().sort({ date: -1 }).limit(5));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch recent announcements' });
+  }
+});
+app.get('/announcements/export', async (req, res) => {
+  try {
+    const announcements = await Announcement.find();
+    if (!announcements.length) return res.status(404).json({ message: 'No announcements found' });
+
+    const fields = ['title', 'caption', 'image', 'date'];
+    const csv = new Parser({ fields }).parse(announcements);
+
+    res.header('Content-Type', 'text/csv');
+    res.attachment('announcements.csv');
+    res.send(csv);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to export announcements' });
+  }
+});
+app.delete('/announcements/:id', async (req, res) => {
+  try {
+    await Announcement.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Announcement deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to delete announcement' });
+  }
+});
+
+// ===== Seed Default Admin =====
+async function seedDefaultAdmin() {
+  try {
+    if (!(await User.findOne({ username: 'admin' }))) {
+      const hash = await bcrypt.hash('admin', 10);
+      const qr = await QRCode.toDataURL(JSON.stringify({ username: 'admin' }));
+      await new User({ username: 'admin', password: hash, role: 'admin', status: 'approved', qrCode: qr }).save();
+      console.log('Default admin account created');
+    } else {
+      console.log('Default admin exists');
+    }
+  } catch (err) {
+    console.error('Error creating default admin:', err);
+  }
+}
+seedDefaultAdmin();
+
+// Function to get the local IP address
+function getLocalIpAddress() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      // Skip over internal (i.e., 127.0.0.1) and non-IPv4 addresses
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return 'localhost'; // Fallback to localhost if no IP is found
+}
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  const localIp = getLocalIpAddress(); // Dynamically get the local IP address
+  const appUrl = `http://${localIp}:${PORT}`;
+  console.log(`Server running on ${appUrl}`);
+
+  // Generate and display the QR code in the terminal
+  qrcode.generate(appUrl, { small: true }, (qr) => {
+    console.log("Scan this QR code to access the application on your mobile device:");
+    console.log(qr);
+  });
+});
+
+app.get('/users/:username/qr', async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.params.username });
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    res.json({ qrCode: user.qrCode });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to fetch QR code' });
+  }
 });
